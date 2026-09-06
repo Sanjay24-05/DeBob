@@ -140,7 +140,7 @@ function makeFileNode(file: ScannedFile): Node {
     filePath: file.relativePath,
     confidence: 1.0,
     dataSource: 'static',
-    metadata: { contentHash: file.contentHash },
+    metadata: { contentHash: file.contentHash, linesOfCode: file.linesOfCode },
   }
 }
 
@@ -204,6 +204,7 @@ function applyFileMetadata(
   node.metadata = {
     ...node.metadata,
     contentHash: file.contentHash,
+    linesOfCode: file.linesOfCode,
     ...(gitStats === undefined
       ? {}
       : {

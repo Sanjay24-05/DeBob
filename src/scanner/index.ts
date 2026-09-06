@@ -113,7 +113,7 @@ export interface ScanOptions {
  * For each file:
  * - Computes a SHA-256 content hash (used for incremental update detection)
  * - Detects language from extension
- * - Records size in bytes
+ * - Records size in bytes and physical line count
  *
  * Files with language "unknown" are included in the result so the engine can
  * still record them in file_cache, but they are not passed to any LanguageAnalyzer.
@@ -179,6 +179,9 @@ export async function scanRepository(
 
       const content = readFileSync(absolutePath)
       const contentHash = sha256(content)
+      const linesOfCode = content.length === 0
+        ? 0
+        : content.toString('utf8').split(/\r\n|\r|\n/).length
 
       files.push({
         path: absolutePath,
@@ -186,6 +189,7 @@ export async function scanRepository(
         extension: ext,
         language,
         sizeBytes: stats.size,
+        linesOfCode,
         contentHash,
       })
     } catch {

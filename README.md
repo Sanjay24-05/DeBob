@@ -36,6 +36,38 @@ model that produced it.
 
 Everything below is for pointing DeBob at a repository of your own.
 
+## ML risk prediction
+
+DeBob includes a reproducible proof-of-concept for ranking potentially risky files from
+the graph's Git churn, author count, import fan-in/fan-out, physical line count, and
+architectural layer. The label is a proxy, not ground truth: files in the top churn
+quartile or touched by commits containing `fix`, `bug`, `hotfix`, or `patch` are marked
+risky. Results are intended for this repository's small dataset, not general accuracy
+claims.
+
+On Windows, install the optional Python dependencies:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ml\install.ps1
+```
+
+Export features, label them, and train the four classifiers:
+
+```powershell
+.\ml\.venv\Scripts\python.exe .\ml\export_features.py
+.\ml\.venv\Scripts\python.exe .\ml\label.py
+.\ml\.venv\Scripts\python.exe .\ml\train_models.py
+.\ml\.venv\Scripts\python.exe .\ml\cluster_models.py
+```
+
+Rank current files with the saved Random Forest model:
+
+```powershell
+node dist/bin/debob.js predict-risk --python .\ml\.venv\Scripts\python.exe --model .\ml\artifacts\models\random_forest.joblib
+```
+
+See [docs/ml-report.md](docs/ml-report.md) for the methodology and caveats.
+
 ---
 
 ## Using DeBob in a New Repository

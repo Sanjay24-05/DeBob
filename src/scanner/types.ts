@@ -16,6 +16,8 @@ export interface ScannedFile {
   language: 'typescript' | 'javascript' | 'python' | 'unknown'
   /** File size in bytes. */
   sizeBytes: number
+  /** Number of physical UTF-8 lines in the file. */
+  linesOfCode: number
   /** SHA-256 hex digest of the file's UTF-8 content. Used for incremental update detection. */
   contentHash: string
 }

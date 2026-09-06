@@ -1,4 +1,5 @@
 import { createRequire } from 'module'
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
@@ -576,6 +577,35 @@ program
       const msg = err instanceof Error ? err.message : String(err)
       console.error(chalk.red(`\n✖  ${msg}`))
       process.exit(1)
+    }
+  })
+
+// ─── predict-risk command ───────────────────────────────────────────────────
+
+program
+  .command('predict-risk')
+  .description('Rank files by predicted risk using a saved Python ML model')
+  .option('--repo <path>', 'Path to the repository root', process.cwd())
+  .option('--model <path>', 'Path to a saved joblib model', 'ml/artifacts/models/random_forest.joblib')
+  .option('--output <path>', 'CSV or JSON prediction output', 'ml/artifacts/predictions.csv')
+  .option('--top <n>', 'Number of files to print', '10')
+  .option('--python <path>', 'Python interpreter to use', 'python')
+  .action((opts: { repo: string; model: string; output: string; top: string; python: string }) => {
+    try {
+      const repoRoot = opts.repo
+      const script = join(repoRoot, 'ml', 'predict_risk.py')
+      execFileSync(opts.python, [
+        script,
+        '--repo', repoRoot,
+        '--model', opts.model,
+        '--output', opts.output,
+        '--top', opts.top,
+      ], { cwd: repoRoot, stdio: 'inherit' })
+    } catch (err) {
+      const code = typeof err === 'object' && err !== null && 'status' in err
+        ? Number((err as { status?: number }).status) || 1
+        : 1
+      process.exit(code)
     }
   })
 

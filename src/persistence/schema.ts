@@ -6,7 +6,7 @@
  * detect when a full re-analysis is needed due to schema migration.
  */
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
 /**
  * All CREATE TABLE statements for context.db.

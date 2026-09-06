@@ -14,6 +14,7 @@ function scanned(relativePath: string): ScannedFile {
     extension: '.ts',
     language: 'typescript',
     sizeBytes: 1,
+    linesOfCode: 1,
     contentHash: 'hash-' + relativePath,
   }
 }
@@ -82,6 +83,13 @@ describe('layer inheritance', () => {
       NO_GIT,
     )
     expect(graph.nodes.get('src/a.ts::helper')?.layer).toBeUndefined()
+  })
+})
+
+describe('file metadata', () => {
+  it('persists physical line count on file nodes', () => {
+    const graph = buildGraph([scanned('src/a.ts')], [], NO_GIT)
+    expect(graph.nodes.get('src/a.ts')?.metadata?.['linesOfCode']).toBe(1)
   })
 })
 

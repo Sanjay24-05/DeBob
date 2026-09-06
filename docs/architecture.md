@@ -35,6 +35,13 @@ It runs inside any Git repository and produces `.debob/context.db` — a SQLite 
 
 The LLM **never receives raw source files**. It receives only structured `ModuleContext` slices assembled from graph data.
 
+The optional ML workflow consumes the same persisted graph. File nodes store a deterministic
+physical `linesOfCode` value in `metadata_json` alongside content hash and Git statistics.
+The Python exporter joins that metadata with `git_file_stats`, import edge degrees, and
+architectural layers to produce one feature row per file. Training artifacts remain outside
+the graph; `debob predict-risk` invokes the versioned Python model bundle and prints ranked
+file probabilities.
+
 ---
 
 ## 2. Core Principle

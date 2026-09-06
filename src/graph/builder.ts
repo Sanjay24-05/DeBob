@@ -142,6 +142,10 @@ export function buildGraph(
     files.map(f => [f.relativePath, f.contentHash]),
   )
 
+  const linesOfCodeMap = new Map(
+    files.map(f => [f.relativePath, f.linesOfCode]),
+  )
+
   for (const [id, node] of nodes) {
     if (node.type !== 'file') continue
 
@@ -152,6 +156,7 @@ export function buildGraph(
     if (gitStats !== undefined || contentHash !== undefined) {
       node.metadata = {
         ...node.metadata,
+        ...(linesOfCodeMap.has(id) ? { linesOfCode: linesOfCodeMap.get(id) } : {}),
         ...(contentHash !== undefined ? { contentHash } : {}),
         ...(gitStats !== undefined
           ? {
