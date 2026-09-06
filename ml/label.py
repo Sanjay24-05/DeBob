@@ -17,8 +17,12 @@ def label_features(repo: Path, features_path: Path, output: Path, db_path: Path 
     rows = read_csv(features_path)
     if not rows:
         raise ValueError("No feature rows were found; cannot create labels.")
-    churn = sorted(float(row.get("churn_score", 0) or 0) for row in rows)
-    threshold = churn[max(0, int(0.75 * len(churn)) - 1)]
+    churn = sorted(
+        float(row.get("churn_score", 0) or 0)
+        for row in rows
+        if float(row.get("churn_score", 0) or 0) > 0
+    )
+    threshold = churn[max(0, int(0.75 * len(churn)) - 1)] if churn else 0.0
     connection = sqlite3.connect(db_path or repo / ".debob" / "context.db")
     try:
         touched_by_fix: set[str] = set()
@@ -34,7 +38,8 @@ def label_features(repo: Path, features_path: Path, output: Path, db_path: Path 
 
     for row in rows:
         path = row["file_path"].replace("\\", "/")
-        row["risky"] = int(float(row.get("churn_score", 0) or 0) >= threshold or path in touched_by_fix)
+        churn_score = float(row.get("churn_score", 0) or 0)
+        row["risky"] = int((churn_score > 0 and churn_score >= threshold) or path in touched_by_fix)
     fields = list(rows[0].keys())
     if "risky" not in fields:
         fields.append("risky")
