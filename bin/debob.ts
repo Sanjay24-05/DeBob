@@ -51,7 +51,7 @@ const pkg = _require(existsSync(sourcePackagePath) ? sourcePackagePath : builtPa
 
 // ─── LLM credential resolution ─────────────────────────────────────────────────
 //
-// Shared by every command that can call watsonx. 'warn' mode (init/update --semantic) treats
+// Shared by every command that can call an LLM. 'warn' mode (init/update --semantic) treats
 // missing/broken credentials as non-fatal — the command continues without LLM enrichment.
 // 'error' mode (review/explain) treats the LLM as mandatory and exits the process.
 
@@ -104,18 +104,6 @@ function resolveLLMAdapter(mode: 'warn' | 'error'): LLMAdapter | undefined {
   const projectId = process.env['WATSONX_PROJECT_ID']
   const url = process.env['WATSONX_URL']
   const modelId = process.env['WATSONX_MODEL_ID']
-
-  if (!apiKey || !projectId || !url || !modelId) {
-    const missing = 'WATSONX_API_KEY, WATSONX_PROJECT_ID, WATSONX_URL, and WATSONX_MODEL_ID'
-    if (mode === 'error') {
-      console.error(
-        chalk.red(`\n✖  This command requires ${missing}.\n   Set them in a .env file at the repository root.`),
-      )
-      process.exit(1)
-    }
-    console.warn(chalk.yellow(`⚠  --semantic was set but ${missing} is missing — skipping LLM enrichment.`))
-    return undefined
-  }
 
   try {
     return createLLMAdapter('watsonx', { provider: 'watsonx', apiKey, projectId, url, modelId })
