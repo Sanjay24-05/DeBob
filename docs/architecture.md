@@ -1,8 +1,9 @@
 # DeBob — Architecture Reference
 
-> This document is the canonical reference for DeBob's design.  
-> It is accurate as of **Sub-Task 11** (all 11 sub-tasks complete).  
-> Sections marked **[future]** describe planned work that is not yet implemented.
+> This document is the canonical reference for DeBob's design. It describes the current
+> implementation: structural graph extraction, incremental updates, agent or watsonx semantic
+> enrichment, graph-grounded questions and diff reviews, visualisation, and optional ML risk
+> prediction.
 
 ---
 
@@ -17,7 +18,7 @@
 7. [LLM Architecture](#7-llm-architecture)
 8. [How to Add a Language Analyzer](#8-how-to-add-a-language-analyzer)
 9. [How to Add an LLM Provider](#9-how-to-add-an-llm-provider)
-10. [How `debob review` Will Be Built](#10-how-debob-review-will-be-built)
+10. [Diff Review](#10-diff-review)
 
 ---
 
@@ -41,6 +42,62 @@ The Python exporter joins that metadata with `git_file_stats`, import edge degre
 architectural layers to produce one feature row per file. Training artifacts remain outside
 the graph; `debob predict-risk` invokes the versioned Python model bundle and prints ranked
 file probabilities.
+
+### Architecture diagram
+
+```mermaid
+flowchart TD
+  repo["Any Git repository"]
+
+  subgraph deterministic["Deterministic analysis — no credentials"]
+    scan["Scanner<br/>ignore rules · size cap · extensions"]
+    analyzers["Language analyzers<br/>TypeScript/JavaScript · Python"]
+    git["Git extractor<br/>history · churn · authors"]
+    build["Graph builder<br/>merge · deduplicate · layer inheritance"]
+  end
+
+  db[((".debob/context.db<br/>nodes · edges · git stats · cache"))]
+  manifest[".debob/manifest.json"]
+
+  subgraph semantic["Optional semantic layer — provenance tracked"]
+    query["Query layer<br/>targeted graph slices"]
+    watsonx{{"IBM watsonx.ai<br/>describe · explain · answer"}}
+    agent["Coding agent<br/>enrich export/import"]
+    enrich[(("semantic_enrichments<br/>responsibility · layer · model"))]
+  end
+
+  subgraph ml["Optional ML workflow"]
+    features["Python feature export<br/>Git + graph metrics"]
+    model["Saved classifier bundle"]
+    predict["predict-risk<br/>ranked file probabilities"]
+  end
+
+  subgraph consumers["Consumers"]
+    cli["CLI<br/>init · update · enrich · review · explain · visualise"]
+    instructions["AGENTS.md<br/>agent discovery"]
+  end
+
+  repo --> scan
+  scan --> analyzers
+  scan --> git
+  analyzers -->|"files · symbols · relationships"| build
+  git -->|"commits · stats · hot files"| build
+  build --> db
+  build --> manifest
+  db --> query
+  query -->|"ModuleContext / graph context<br/>never raw source"| watsonx
+  query -->|"exported module tasks"| agent
+  watsonx --> enrich
+  agent -->|"validated answers"| enrich
+  enrich --> db
+  db --> features --> model --> predict
+  db --> cli
+  db --> instructions
+```
+
+The structural path is reproducible without credentials. Semantic output is stored separately
+with provider and model provenance. The ML workflow reads graph-derived features and writes model
+artifacts outside the graph.
 
 ---
 
@@ -90,7 +147,8 @@ Runs the full analysis pipeline in sequence:
 4. `extractGitMetadata()` — commit history and file stats
 5. `buildGraph()` — merge all sources into a deduplicated graph
 6. `openDb()` + `SqlitePersistenceAdapter` — persist to `.debob/context.db`
-7. *(optional)* LLM enrichment via `buildModuleContext()` + `llm.summarizeModule()` / `llm.classifyLayer()`
+7. *(optional)* LLM enrichment via `buildModuleContext()` and `llm.describeModule()`; providers
+  fall back to `summarizeModule()` plus `classifyLayer()` when needed
 8. `adapter.close()` — **required**: sql.js does not save to disk without this call
 9. `writeManifest()` — write `.debob/manifest.json`
 10. Return `InitResult` with counts, hot files, layer distribution, package deps, db path
@@ -166,7 +224,7 @@ Three layers:
 
 ### `src/query/index.ts` — Graph Query Helpers
 
-Helper functions used by the context builder and future query layer:
+Helper functions used by semantic enrichment, explain, review, and the visualiser:
 
 | Function | Description |
 |---|---|
@@ -174,16 +232,19 @@ Helper functions used by the context builder and future query layer:
 | `getFileImports(graph, filePath)` | Targets of outgoing `imports` edges |
 | `getFileExports(graph, filePath)` | Targets of outgoing `exports` edges |
 | `getNodeNeighbours(graph, nodeId, depth)` | BFS traversal both directions up to `depth` hops |
-| `buildModuleContext(node, graph)` | Assemble a `ModuleContext` slice (also in `src/llm/context.ts`) |
+| `buildModuleContext(node, graph)` | Assemble a `ModuleContext` slice from graph data |
 
 ### `src/llm/` — LLM Layer
 
 | File | Role |
 |---|---|
 | `adapter.ts` | `LLMAdapter` interface + `LLMConfig`, `ModuleContext`, `DiffContext`, `QueryContext` types |
-| `context.ts` | `buildModuleContext(node, graph, gitStats?)` — assembles the LLM input slice |
 | `index.ts` | `createLLMAdapter(provider, config)` factory — routes to concrete implementation |
-| `providers/watsonx.ts` | `WatsonxAdapter` — IBM watsonx REST API implementation |
+| `providers/watsonx.ts` | `WatsonxAdapter` — IBM watsonx REST API implementation, structured descriptions, questions, and diff reviews |
+
+The adapter also exposes optional provider token usage. The engine reports prompt, completion,
+total, and call counts when the provider supplies them, alongside the source-byte estimate used
+for the reduction measurement.
 
 ---
 
@@ -376,11 +437,9 @@ Written alongside `context.db` after each `debob init` run:
 
 ## 6. Incremental Update Design
 
-> **[future]** `debob update` is not yet implemented. This section describes the design that `file_cache` was built to support.
+The `file_cache` table enables incremental re-analysis without rebuilding unchanged files.
 
-The `file_cache` table makes incremental re-analysis possible without rescanning unchanged files.
-
-**On `debob update` (future command):**
+**On `debob update`:**
 
 1. Read all `file_cache` entries from `.debob/context.db`
 2. Scan the repository (same guards as `debob init`)
@@ -390,8 +449,12 @@ The `file_cache` table makes incremental re-analysis possible without rescanning
    - `schemaVersion` differs (schema was migrated)
 4. Re-analyze only files that fail any check; copy existing nodes/edges for unchanged files
 5. Run git extraction only for commits newer than `lastGitCommit`
-6. Rebuild graph from merged old + new analysis results
+6. Rebuild the affected graph portion from merged old + new analysis results
 7. Persist and close
+
+When `--semantic` is supplied, only re-analyzed file modules are sent for enrichment, using the
+same bounded concurrency as `init`. If the schema version changes, `update` falls back to a full
+initialisation.
 
 **Schema migration:** When `SCHEMA_VERSION` in `src/persistence/schema.ts` is incremented, all `file_cache` entries have a stale `schema_version` and will be re-analyzed on the next `debob update`.
 
@@ -405,18 +468,23 @@ The `file_cache` table makes incremental re-analysis possible without rescanning
 
 > **The LLM never receives raw source code.**
 
-The context builder (`src/llm/context.ts`) assembles a `ModuleContext` slice for each file node using only graph-derived data:
+The context builder (`src/query/index.ts`) assembles a `ModuleContext` slice for each file node using only graph-derived data:
 
 ```ts
 interface ModuleContext {
   filePath: string                    // relative path
   imports: string[]                   // targets of outgoing "imports" edges
-  exports: string[]                   // targets of outgoing "exports" edges
+  reExports: string[]                 // targets of outgoing "exports" edges
   declarations: Array<{               // symbol nodes belonging to this file
     name: string
     type: 'function' | 'class' | 'interface' | 'variable'
     startLine?: number
+    doc?: string
   }>
+  layer?: string
+  calls?: string[]
+  calledBy?: string[]
+  doc?: string
   gitStats?: {                        // from node.metadata / GitFileStats
     churnScore: number
     authorCount: number
@@ -425,7 +493,8 @@ interface ModuleContext {
 }
 ```
 
-This slice is what `WatsonxAdapter.summarizeModule()` and `WatsonxAdapter.classifyLayer()` receive. No source content, no file paths embedded in strings, no raw AST.
+This slice is what `WatsonxAdapter.describeModule()` receives. Providers may fall back to the two
+older methods, but the input remains graph-derived: no source content, no raw AST.
 
 ### LLM Adapter Interface
 
@@ -433,8 +502,10 @@ This slice is what `WatsonxAdapter.summarizeModule()` and `WatsonxAdapter.classi
 interface LLMAdapter {
   summarizeModule(context: ModuleContext): Promise<string>
   classifyLayer(context: ModuleContext): Promise<string>
-  explainDiff(context: DiffContext): Promise<string>      // [future] debob review
-  answerQuestion(context: QueryContext): Promise<string>  // [future] debob explain
+  describeModule?(context: ModuleContext, preamble?: string): Promise<ModuleDescription>
+  explainDiff(context: DiffContext): Promise<string>
+  answerQuestion(context: QueryContext): Promise<string>
+  getUsage?(): TokenUsage | undefined
 }
 ```
 
@@ -445,8 +516,12 @@ interface LLMAdapter {
 - REST endpoint: `POST {endpoint}/ml/v1/text/generation?version=2023-05-29`
 - Request body: `{ "model_id": "...", "project_id": "...", "input": "...", "parameters": { "max_new_tokens": 256 } }`
 - Auth: `Authorization: Bearer {apiKey}`
-- Default model: `ibm/granite-13b-instruct-v2`
-- Prompt format: structured plain text listing file path, imports, exports, declarations, and optional git stats — never source code
+- Prompt format: structured plain text listing file path, imports, re-exports, declarations,
+  calls, documentation comments, layer, and optional Git stats — never source code for module
+  enrichment or graph questions
+- `describeModule()` returns responsibility and layer in one request; malformed responses fall back
+  per module to the two separate operations
+- Provider usage is accumulated from reported prompt, completion, total, and call counts
 
 ### Semantic Enrichment Storage
 
@@ -584,13 +659,12 @@ No other changes needed.
 
 ---
 
-## 10. How `debob review` Will Be Built
+## 10. Diff Review
 
-> **[future]** `debob review` is not yet implemented. This section describes the intended design.
+`debob review` diffs the working tree (or a specified base ref) against the stored graph to
+produce an LLM-generated impact analysis.
 
-`debob review` will diff the working tree (or a specified commit range) against the stored graph to produce an LLM-generated impact analysis.
-
-**Planned pipeline:**
+**Pipeline:**
 
 1. Capture the unified diff (`git diff HEAD` or a supplied range)
 2. Parse affected file paths from the diff header lines
@@ -600,11 +674,13 @@ No other changes needed.
    ```ts
    { diff, affectedNodes, neighbourhood, layersSummary }
    ```
-6. Call `llm.explainDiff(context)` — which `WatsonxAdapter` will implement at that point
+6. Truncate the unified diff to a bounded number of lines and call `llm.explainDiff(context)`
 7. Render the output with `chalk`
 
-The `DiffContext` type is already defined in `src/llm/adapter.ts`. The `getNodeNeighbours` traversal helper is already implemented in `src/query/index.ts`. The foundation is in place; only the CLI command and `explainDiff` implementation remain.
+Changed paths that are not yet in the graph are reported as non-fatal notes; running `debob update`
+before the review refreshes new or renamed files. The raw diff is deliberately the exception to
+the no-source rule because review must describe what changed, and the request is bounded.
 
 ---
 
-*This document was generated as part of Sub-Task 11 and reflects the state of the codebase after all 11 sub-tasks are complete.*
+*Keep this document aligned with the CLI and the interfaces in `src/` when behavior changes.*

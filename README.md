@@ -141,7 +141,7 @@ Before committing or reviewing a PR, explain the architectural impact of your ch
 node dist/bin/debob.js review
 ```
 
-Requires watsonx credentials. Reads the current `git diff HEAD`, maps changed files to their graph neighbourhood, and asks the LLM to explain risks and affected modules — without sending raw source code.
+Requires watsonx credentials. Reads the current `git diff HEAD`, maps changed files to their graph neighbourhood, and asks the LLM to explain risks and affected modules. The bounded unified diff is the deliberate exception to the no-source rule for graph-grounded review.
 
 ---
 
@@ -158,6 +158,7 @@ node dist/bin/debob.js init [options]
 | `--repo <path>` | Path to the repository root | current directory |
 | `--max-commits <n>` | Maximum Git commits to analyze | `500` |
 | `--semantic` | Run LLM enrichment after structural extraction | off |
+| `--concurrency <n>` | Maximum modules enriched concurrently | `6` |
 | `--verbose` | Log each pipeline stage with counts | off |
 
 **Output:**
@@ -207,6 +208,7 @@ Re-analyzes only files whose content hash has changed since the last `init` or `
 |---|---|---|
 | `--repo <path>` | Path to the repository root | current directory |
 | `--semantic` | Run LLM enrichment on re-analyzed files only | off |
+| `--concurrency <n>` | Maximum modules enriched concurrently | `6` |
 | `--verbose` | List the re-analyzed files | off |
 
 Requires `debob init` to have been run first. If the schema version has changed since `init`, `update` automatically falls back to a full `init`.
@@ -340,7 +342,7 @@ Credentials are **never** written to `.debob/` or any config file. If any variab
 ```
 .debob/
 ├── context.db      # SQLite knowledge graph
-└── manifest.json   # Run metadata (version, counts, timestamp, headCommit, semantic flag)
+└── manifest.json   # Run metadata (version, counts, timestamp, headCommit, semantic state)
 ```
 
 ### `context.db` tables
@@ -367,18 +369,25 @@ flowchart TD
         build["Graph builder<br/>merge + deduplicate + layer inheritance"]
     end
 
-    db[("(.debob/context.db)<br/>nodes · edges · git_file_stats · file_cache")]
+    db[(".debob/context.db<br/>nodes · edges · git stats · cache")]
 
     subgraph sem ["Optional semantic layer — confidence < 1.0, quarantined"]
-        q["Query layer<br/>buildModuleContext"]
-        wx{{"IBM watsonx.ai<br/>describeModule · answerQuestion · explainDiff"}}
-        se[("semantic_enrichments<br/>responsibility · layer · model")]
+        q["Query layer<br/>targeted graph context"]
+        wx{{"IBM watsonx.ai<br/>describe · explain · answer"}}
+        agent["Coding agent<br/>enrich export/import"]
+        se[("semantic_enrichments<br/>responsibility · layer · provenance")]
     end
 
+      subgraph ml ["Optional ML workflow"]
+        features["Python feature export<br/>Git + graph metrics"]
+        model["Saved model bundle"]
+        risk["predict-risk<br/>ranked files"]
+      end
+
     subgraph out ["Consumers"]
-        cli["CLI<br/>init · update · review · explain · visualise"]
+        cli["CLI<br/>init · update · enrich · review · explain · visualise · predict-risk"]
         ag["AGENTS.md<br/>auto-discovery for any agent"]
-        bob["IBM Bob skills<br/>debob-query · debob-enrich"]
+        bob["Agent skills<br/>debob-query · debob-enrich"]
     end
 
     repo --> scan
@@ -390,7 +399,12 @@ flowchart TD
     db --> q
     q -->|"ModuleContext slice — never the source"| wx
     wx --> se
+    q -->|"Exported tasks"| agent
+    agent -->|"Validated answers"| se
     se --> db
+    db --> features
+    features --> model
+    model --> risk
     db --> cli
     db --> ag
     db --> bob
