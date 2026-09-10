@@ -25,18 +25,20 @@ MODEL_LABELS = {
 def load_metrics(models_dir: Path) -> tuple[dict, pd.DataFrame]:
     payload = json.loads((models_dir / "metrics.json").read_text(encoding="utf-8"))
     rows = []
-    for experiment, experiment_rows in payload["experiments"].items():
+    for experiment, experiment_rows in payload.get("experiments", {}).items():
+        rows.extend(experiment_rows)
+    for experiment, experiment_rows in payload.get("diagnostic_experiments", {}).items():
         rows.extend(experiment_rows)
     return payload, pd.DataFrame(rows)
 
 
 def save_model_comparison(frame: pd.DataFrame, output: Path) -> None:
     learned = frame[frame["model"].isin(MODEL_ORDER)]
-    figure, axes = plt.subplots(1, 3, figsize=(15, 5))
+    figure, axes = plt.subplots(1, 4, figsize=(18, 5))
     for axis, metric, title in zip(
         axes,
-        ("f1_mean", "recall_mean", "roc_auc_mean"),
-        ("Risky-class F1", "Risky-class recall", "ROC-AUC"),
+        ("f1_mean", "recall_mean", "roc_auc_mean", "precision_at_5"),
+        ("Risky-class F1", "Risky-class recall", "ROC-AUC", "Precision@5"),
     ):
         chart = learned.pivot(index="model", columns="experiment", values=metric).reindex(MODEL_ORDER)
         chart.index = [MODEL_LABELS[name] for name in chart.index]
@@ -45,7 +47,7 @@ def save_model_comparison(frame: pd.DataFrame, output: Path) -> None:
         axis.set_ylim(0, 1)
         axis.set_ylabel("score")
         axis.legend(title="feature set")
-    figure.suptitle("DeBob model comparison", fontsize=16, fontweight="bold")
+    figure.suptitle("DeBob model comparison (recommended: Random Forest without churn)", fontsize=16, fontweight="bold")
     figure.tight_layout()
     figure.savefig(output, dpi=180)
     plt.close(figure)
@@ -69,15 +71,15 @@ def save_ablation(frame: pd.DataFrame, output: Path) -> None:
 
 
 def save_top_k(frame: pd.DataFrame, baseline: dict, output: Path) -> None:
-    rows = frame[frame["model"].isin(["logistic_regression", "random_forest"])].copy()
-    rows["label"] = rows["experiment"].map({"with_churn": "RF/logistic with churn", "without_churn": "RF/logistic without churn"}) + " / " + rows["model"].map(MODEL_LABELS)
+    rows = frame[frame["model"].isin(MODEL_ORDER)].copy()
+    rows["label"] = rows["experiment"].str.replace("_", " ") + " / " + rows["model"].map(MODEL_LABELS)
     baseline_row = pd.DataFrame([baseline])
     baseline_row["label"] = "Raw churn heuristic"
     rows = pd.concat([rows, baseline_row], ignore_index=True)
     labels = rows["label"].tolist()
     positions = np.arange(len(labels))
     width = 0.19
-    figure, axis = plt.subplots(figsize=(12, 5))
+    figure, axis = plt.subplots(figsize=(14, 6))
     for offset, metric, title, color in [
         (-width, "precision_at_5", "Precision@5", "#2a9d8f"),
         (0, "recall_at_5", "Recall@5", "#e9c46a"),
@@ -86,10 +88,10 @@ def save_top_k(frame: pd.DataFrame, baseline: dict, output: Path) -> None:
     ]:
         axis.bar(positions + offset, rows[metric].astype(float), width, label=title, color=color)
     axis.set_xticks(positions)
-    axis.set_xticklabels(labels, rotation=30, ha="right")
+    axis.set_xticklabels(labels, rotation=35, ha="right")
     axis.set_ylim(0, 1)
     axis.set_ylabel("score")
-    axis.set_title("Review-priority ranking quality")
+    axis.set_title("Review-priority ranking quality (★ = recommended)")
     axis.legend(ncol=2)
     figure.tight_layout()
     figure.savefig(output, dpi=180)
@@ -117,7 +119,16 @@ def save_confusion(models_dir: Path, output_dir: Path) -> None:
 
 
 def save_feature_importance(models_dir: Path, output: Path) -> None:
-    bundle = joblib.load(models_dir / "random_forest.joblib")
+    # Prefer the diagnostic bundle (has churn feature importance); fall back to operational
+    diagnostic_path = models_dir / "random_forest_with_churn_diagnostic.joblib"
+    operational_path = models_dir / "random_forest_without_churn.joblib"
+    fallback_path = models_dir / "random_forest.joblib"
+    if diagnostic_path.exists():
+        bundle = joblib.load(diagnostic_path)
+    elif fallback_path.exists():
+        bundle = joblib.load(fallback_path)
+    else:
+        bundle = joblib.load(operational_path)
     importance = pd.Series(bundle["feature_importance"]).sort_values()
     axis = importance.plot(kind="barh", figsize=(8, 4), color="#1769aa", title="Random Forest global feature importance")
     axis.set_xlabel("importance")

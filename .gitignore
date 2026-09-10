@@ -40,3 +40,5 @@ _scratch_*.mjs
 # ML environments and generated artifacts
 ml/.venv/
 ml/artifacts/
+
+.pptx

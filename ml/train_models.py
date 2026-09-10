@@ -28,10 +28,11 @@ from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 import sklearn
 
-from common import NUMERIC_FEATURES, LAYER_FEATURE
+from common import NUMERIC_FEATURES, LAYER_FEATURE, OPERATIONAL_MODEL_NAME, DIAGNOSTIC_MODEL_NAME, DEFAULT_TOP_K
 
 SEED = 42
 FOLDS = 5
+LABEL_CAVEAT = "Labels are proxy heuristics, not observed defects; results are not general accuracy estimates."
 
 
 def make_pipeline(estimator: object, numeric_features: list[str]) -> Pipeline:
@@ -86,13 +87,22 @@ def ranking_values(actual: list[int], probabilities: list[float]) -> dict[str, f
     return values
 
 
-def summarize(experiment: str, model_name: str, fold_metrics: list[dict[str, float]], matrix: np.ndarray) -> dict[str, object]:
+def summarize(
+    experiment: str,
+    model_name: str,
+    fold_metrics: list[dict[str, float]],
+    matrix: np.ndarray,
+    actual: list[int],
+    candidate_scope: str,
+) -> dict[str, object]:
     result: dict[str, object] = {"experiment": experiment, "model": model_name, "folds": len(fold_metrics)}
     for metric in ["accuracy", "precision", "recall", "f1", "roc_auc"]:
         values = np.array([row[metric] for row in fold_metrics], dtype=float)
         result[f"{metric}_mean"] = float(np.nanmean(values))
         result[f"{metric}_std"] = float(np.nanstd(values, ddof=1)) if len(values) > 1 else 0.0
     result["confusion_matrix"] = matrix.tolist()
+    result["candidate_scope"] = candidate_scope
+    result["class_counts"] = {"0": actual.count(0), "1": actual.count(1)}
     return result
 
 
@@ -101,6 +111,7 @@ def evaluate_experiment(
     numeric_features: list[str],
     experiment: str,
     folds: list[tuple[np.ndarray, np.ndarray]],
+    candidate_scope: str,
 ) -> tuple[list[dict[str, object]], dict[str, Pipeline]]:
     x = data[[*numeric_features, LAYER_FEATURE]]
     y = data["risky"].astype(int)
@@ -124,7 +135,7 @@ def evaluate_experiment(
             pooled_probabilities.extend(probabilities.tolist())
 
         matrix = confusion_matrix(pooled_actual, pooled_predicted, labels=[0, 1])
-        result = summarize(experiment, model_name, fold_metrics, matrix)
+        result = summarize(experiment, model_name, fold_metrics, matrix, pooled_actual, candidate_scope)
         result.update(ranking_values(pooled_actual, pooled_probabilities))
         results.append(result)
         final_pipeline = make_pipeline(estimator, numeric_features)
@@ -146,7 +157,14 @@ def evaluate_experiment(
         pooled_actual.extend(actual.tolist())
         pooled_predicted.extend(predicted.tolist())
         pooled_probabilities.extend(probabilities.tolist())
-    baseline = summarize(experiment, "raw_churn_heuristic", baseline_folds, confusion_matrix(pooled_actual, pooled_predicted, labels=[0, 1]))
+    baseline = summarize(
+        experiment,
+        "raw_churn_heuristic",
+        baseline_folds,
+        confusion_matrix(pooled_actual, pooled_predicted, labels=[0, 1]),
+        pooled_actual,
+        candidate_scope,
+    )
     baseline.update(ranking_values(pooled_actual, pooled_probabilities))
     results.append(baseline)
     return results, final_pipelines
@@ -154,16 +172,24 @@ def evaluate_experiment(
 
 def train(input_path: Path, output_dir: Path) -> None:
     data = pd.read_csv(input_path)
-    required = [*NUMERIC_FEATURES, LAYER_FEATURE, "risky"]
+    required = [*NUMERIC_FEATURES, LAYER_FEATURE, "file_category", "meaningful_code", "risky"]
     missing = [column for column in required if column not in data.columns]
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(missing)}")
+    if set(data["file_category"].dropna().unique()) != {"source"} or not (data["meaningful_code"].astype(str) == "1").all():
+        raise ValueError("Training input must contain only meaningful source files. Regenerate features with --scope source.")
     if len(data) < 10 or data["risky"].nunique() < 2:
         raise ValueError("At least 10 rows and both risk classes are required for training.")
     if int(data["risky"].value_counts().min()) < FOLDS:
         raise ValueError(f"Each risk class needs at least {FOLDS} rows for {FOLDS}-fold stratified validation.")
 
     y = data["risky"].astype(int)
+    small_data_warning = (
+        f"Small dataset: {len(data)} source candidates with class counts "
+        f"0={int((y == 0).sum())}, 1={int((y == 1).sum())}; metrics are not general accuracy estimates."
+        if len(data) < 50 or int(y.value_counts().min()) < 10
+        else None
+    )
     splitter = StratifiedKFold(n_splits=FOLDS, shuffle=True, random_state=SEED)
     folds = list(splitter.split(data, y))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -185,9 +211,9 @@ def train(input_path: Path, output_dir: Path) -> None:
         "db_head_commits": sorted(str(value) for value in data["db_head_commit"].dropna().unique()) if "db_head_commit" in data else [],
     }
 
-    inclusive_results, inclusive_pipelines = evaluate_experiment(data, list(NUMERIC_FEATURES), "with_churn", folds)
+    inclusive_results, inclusive_pipelines = evaluate_experiment(data, list(NUMERIC_FEATURES), "with_churn", folds, "source")
     no_churn_features = [feature for feature in NUMERIC_FEATURES if feature != "churn_score"]
-    no_churn_results, no_churn_pipelines = evaluate_experiment(data, no_churn_features, "without_churn", folds)
+    no_churn_results, no_churn_pipelines = evaluate_experiment(data, no_churn_features, "without_churn", folds, "source")
     results = inclusive_results + no_churn_results
 
     for result in results:
@@ -207,6 +233,10 @@ def train(input_path: Path, output_dir: Path) -> None:
             "seed": SEED,
             "model_name": model_name,
             "experiment": experiment,
+            "candidate_scope": "source",
+            "small_data_warning": small_data_warning,
+            "label_caveat": LABEL_CAVEAT,
+            "leakage_warning": "churn_score is present in both features and the proxy label; use the without_churn bundle for operational ranking." if experiment == "with_churn" else None,
             "training_rows": len(data),
             "feature_importance": dict(sorted(aggregated.items(), key=lambda item: item[1], reverse=True)),
             "feature_thresholds": {
@@ -216,8 +246,8 @@ def train(input_path: Path, output_dir: Path) -> None:
             "provenance": {**provenance, "features": [*features, LAYER_FEATURE], "experiment": experiment, "model_name": model_name},
         }
 
-    joblib.dump(bundle(inclusive_pipelines["random_forest"], list(NUMERIC_FEATURES), "random_forest", "with_churn"), output_dir / "random_forest.joblib")
-    joblib.dump(bundle(no_churn_pipelines["random_forest"], no_churn_features, "random_forest_without_churn", "without_churn"), output_dir / "random_forest_without_churn.joblib")
+    joblib.dump({**bundle(inclusive_pipelines["random_forest"], list(NUMERIC_FEATURES), "random_forest", "with_churn"), "diagnostic_only": True}, output_dir / f"{DIAGNOSTIC_MODEL_NAME}.joblib")
+    joblib.dump(bundle(no_churn_pipelines["random_forest"], no_churn_features, "random_forest_without_churn", "without_churn"), output_dir / f"{OPERATIONAL_MODEL_NAME}.joblib")
 
     frame = pd.DataFrame([{key: value for key, value in result.items() if key != "confusion_matrix"} for result in results])
     frame.sort_values(["experiment", "f1_mean"], ascending=[True, False]).to_csv(output_dir / "metrics.csv", index=False)
@@ -233,19 +263,48 @@ def train(input_path: Path, output_dir: Path) -> None:
         (row for row in serializable if row["model"] == "raw_churn_heuristic"),
         None,
     )
+    # Select the recommended operational model: precision@5 first, then F1, then recall
+    operational = frame[
+        (frame["experiment"] == "without_churn") &
+        (frame["model"].isin(["logistic_regression", "decision_tree", "random_forest", "svm_rbf"]))
+    ].copy()
+    operational = operational.sort_values(
+        ["precision_at_5", "f1_mean", "recall_mean"],
+        ascending=[False, False, False],
+    )
+    recommended = operational.iloc[0]
+    recommended_model = {
+        "model": str(recommended["model"]),
+        "experiment": "without_churn",
+        "precision_at_5": float(recommended["precision_at_5"]),
+        "f1_mean": float(recommended["f1_mean"]),
+        "recall_mean": float(recommended["recall_mean"]),
+        "rationale": "precision@5 is the primary metric because the product ranks a short top-list for human review.",
+    }
     metrics_payload = {
         "seed": SEED,
         "folds": FOLDS,
-        "primary_metrics": ["f1_mean", "recall_mean"],
-        "experiments": experiments,
+        "primary_metrics": ["precision_at_5", "f1_mean", "recall_mean"],
+        "recommended_model": recommended_model,
+        "experiments": {
+            "without_churn": experiments["without_churn"],
+        },
+        "diagnostic_experiments": {
+            "with_churn": experiments["with_churn"],
+        },
         "baselines": {"raw_churn_heuristic": baselines} if baselines else {},
+        "candidate_scope": "source",
+        "class_counts": {"0": int((y == 0).sum()), "1": int((y == 1).sum())},
+        "small_data_warning": small_data_warning,
+        "label_caveat": LABEL_CAVEAT,
+        "leakage_warning": "with_churn metrics are label-leakage diagnostics, not evidence of predictive accuracy; use without_churn for operational ranking.",
     }
     metrics_payload["provenance"] = provenance
     (output_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2, allow_nan=False), encoding="utf-8")
 
     learned = frame[frame["model"].isin(["logistic_regression", "decision_tree", "random_forest", "svm_rbf"])]
-    figure, axes = plt.subplots(1, 2, figsize=(11, 5))
-    for axis, metric, title in zip(axes, ("f1_mean", "recall_mean"), ("F1 by feature set", "Recall by feature set")):
+    figure, axes = plt.subplots(1, 3, figsize=(15, 5))
+    for axis, metric, title in zip(axes, ("f1_mean", "recall_mean", "precision_at_5"), ("F1 by feature set", "Recall by feature set", "Precision@5 by feature set")):
         chart_data = learned.pivot(index="model", columns="experiment", values=metric)
         chart_data.plot(kind="bar", ax=axis, rot=25, title=title)
         axis.set_ylabel("score")
@@ -256,10 +315,12 @@ def train(input_path: Path, output_dir: Path) -> None:
     plt.close(figure)
 
     winners = frame[frame["model"].isin(["logistic_regression", "decision_tree", "random_forest", "svm_rbf"])]
-    winners = winners.sort_values(["experiment", "f1_mean", "recall_mean"], ascending=[True, False, False]).groupby("experiment").first()
+    winners = winners.sort_values(["experiment", "precision_at_5", "f1_mean", "recall_mean"], ascending=[True, False, False, False]).groupby("experiment").first()
     print("Cross-validation complete")
+    print(f"Recommended operational model: {recommended_model['model']} (precision@5={recommended_model['precision_at_5']:.2f})")
     for experiment, row in winners.iterrows():
-        print(f"{experiment}: {row['model']} F1={row['f1_mean']:.3f} +/- {row['f1_std']:.3f}, recall={row['recall_mean']:.3f} +/- {row['recall_std']:.3f}")
+        p_at_5 = row['precision_at_5'] if 'precision_at_5' in row else float('nan')
+        print(f"  {experiment}: {row['model']} p@5={p_at_5:.2f}, F1={row['f1_mean']:.3f} +/- {row['f1_std']:.3f}, recall={row['recall_mean']:.3f} +/- {row['recall_std']:.3f}")
 
 
 def main() -> None:

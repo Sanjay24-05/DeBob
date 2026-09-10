@@ -63,7 +63,7 @@ Export features, label them, and train the four classifiers:
 Rank current files with the saved Random Forest model:
 
 ```powershell
-node dist/bin/debob.js predict-risk --python .\ml\.venv\Scripts\python.exe --model .\ml\artifacts\models\random_forest.joblib
+node dist/bin/debob.js predict-risk --python .\ml\.venv\Scripts\python.exe --model .\ml\artifacts\models\random_forest_without_churn.joblib
 ```
 
 See [docs/ml-report.md](docs/ml-report.md) for the methodology and caveats.

@@ -574,11 +574,12 @@ program
   .command('predict-risk')
   .description('Rank files by predicted risk using a saved Python ML model')
   .option('--repo <path>', 'Path to the repository root', process.cwd())
-  .option('--model <path>', 'Path to a saved joblib model', 'ml/artifacts/models/random_forest.joblib')
+  .option('--model <path>', 'Path to a saved joblib model', 'ml/artifacts/models/random_forest_without_churn.joblib')
   .option('--output <path>', 'CSV or JSON prediction output', 'ml/artifacts/predictions.csv')
   .option('--top <n>', 'Number of files to print', '10')
+  .option('--scope <scope>', 'Prediction candidate scope: source or all', 'source')
   .option('--python <path>', 'Python interpreter to use', 'python')
-  .action((opts: { repo: string; model: string; output: string; top: string; python: string }) => {
+  .action((opts: { repo: string; model: string; output: string; top: string; scope: string; python: string }) => {
     try {
       const repoRoot = opts.repo
       const script = join(repoRoot, 'ml', 'predict_risk.py')
@@ -588,6 +589,7 @@ program
         '--model', opts.model,
         '--output', opts.output,
         '--top', opts.top,
+        '--scope', opts.scope,
       ], { cwd: repoRoot, stdio: 'inherit' })
     } catch (err) {
       const code = typeof err === 'object' && err !== null && 'status' in err

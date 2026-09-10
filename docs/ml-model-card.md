@@ -21,10 +21,11 @@ whose subject contains `fix`, `bug`, `hotfix`, or `patch`.
 
 ## Evaluation
 
-Training uses shuffled, stratified five-fold cross-validation with seed `42`. Risky-class F1
-and recall are primary metrics. The experiment is reported both with and without `churn_score`.
-The churn-inclusive experiment is expected to be optimistic because churn helps define the
-label. The no-churn experiment reduces direct feature leakage but still uses the same weak label.
+Training uses shuffled, stratified five-fold cross-validation with seed `42`. Precision@5 is
+the primary metric because the product ranks a short list for human review. Risky-class F1
+and recall are secondary. The experiment is reported both with and without `churn_score`. The
+churn-inclusive experiment is a leakage diagnostic only; the without-churn Random Forest is the
+operational model.
 
 ## Output explanations
 
@@ -41,10 +42,16 @@ metadata sidecar next to the CSV or JSON output.
 ## Example
 
 ```text
-0.985 src/engine/index.ts
-  - high commit-touch churn (12)
-  - high import fan-in (8)
+0.985 bin/debob.ts
+  - high import fan-out (8)
+  - many contributors (4)
+0.920 src/engine/index.ts
+  - high import fan-in (6)
+  - large module (340)
 ```
+
+The `with_churn` diagnostic model (`random_forest_with_churn_diagnostic.joblib`) is retained
+for leakage detection. Loading it for prediction will print a warning.
 
 The current repository is small, so high variance and snapshot-specific behavior are expected.
 A production version should use historical snapshots, future bug-fix labels, temporal validation,
