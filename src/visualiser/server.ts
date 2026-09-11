@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import type { Edge, Node } from '../graph/types.js'
@@ -9,6 +9,14 @@ import {
   type Manifest,
 } from '../persistence/sqlite.js'
 
+/** One influential-signal entry from a prediction row's `risk_reasons`. */
+interface RiskReason {
+  feature: string
+  label: string
+  value: number
+  importance: number
+}
+
 type VisualiserNode = Pick<
   Node,
   'id' | 'type' | 'name' | 'filePath' | 'layer' | 'startLine' | 'endLine' | 'confidence' | 'dataSource' | 'metadata'
@@ -17,13 +25,40 @@ type VisualiserNode = Pick<
   responsibility?: string
   /** Model that produced `responsibility`, for attribution in the UI. */
   responsibilityModel?: string
+  /** Model-assigned risk score, joined from ml/artifacts/predictions.json. */
+  riskProbability?: number
+  /** Whether the model classed this file risky (probability >= 0.5). */
+  predictedRisky?: boolean
+  /** Influential signals behind the score — NOT causal explanations. */
+  riskReasons?: RiskReason[]
 }
 type VisualiserEdge = Pick<Edge, 'id' | 'source' | 'target' | 'type' | 'confidence' | 'dataSource'>
+
+/**
+ * Coverage and provenance for the ML overlay.
+ *
+ * `available: false` carries a `hint` instead of counts — the overlay is a strictly
+ * optional layer, because `ml/artifacts/` is gitignored and a fresh clone ships the
+ * graph without any predictions.
+ */
+interface PredictionInfo {
+  available: boolean
+  /** Why the overlay is unavailable, phrased as the command that would fix it. */
+  hint?: string
+  /** Rows actually present in the file — `--top` truncates what gets written. */
+  rowsShown?: number
+  /** Candidates the model scored, from the sidecar. Usually far larger than `rowsShown`. */
+  candidateCount?: number
+  modelName?: string
+  /** True when the predictions were scored against a different graph than the one loaded. */
+  stale?: boolean
+}
 
 interface VisualiserPayload {
   manifest: Manifest | null
   nodes: VisualiserNode[]
   edges: VisualiserEdge[]
+  predictionInfo: PredictionInfo
 }
 
 /**
@@ -63,12 +98,19 @@ export async function startVisualiserServer(
     })
   }
 
+  const manifest = readManifest(repoRoot)
+  // Predictions are read once here, alongside the graph, and the payload is frozen for the
+  // lifetime of the server. Re-running `debob predict-risk` therefore needs a `visualise`
+  // restart to show up — that is the same contract the graph itself has, not a bug.
+  const { info: predictionInfo, rows: predictions } = readPredictions(repoRoot, manifest)
+
   const payload: VisualiserPayload = {
-    manifest: readManifest(repoRoot),
+    manifest,
     nodes: Array.from(graph.nodes.values()).map(node =>
-      serialiseNode(node, responsibilities.get(node.id)),
+      serialiseNode(node, responsibilities.get(node.id), predictions.get(node.id)),
     ),
     edges: graph.edges.map(serialiseEdge),
+    predictionInfo,
   }
   const requestedPort = options.port ?? 7842
   if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
@@ -92,9 +134,110 @@ export async function startVisualiserServer(
   throw new Error('Unable to start graph visualiser: the next 5 ports are already in use.')
 }
 
+/** One row as written by ml/predict_risk.py. */
+interface PredictionRow {
+  riskProbability: number
+  predictedRisky: boolean
+  riskReasons: RiskReason[]
+}
+
+/**
+ * Loads the ML risk predictions, if the pipeline has been run.
+ *
+ * Returns an empty map and an unavailable `PredictionInfo` for every failure mode rather
+ * than throwing: the overlay is optional, and a missing or malformed prediction file must
+ * never stop the graph from rendering.
+ */
+function readPredictions(
+  repoRoot: string,
+  manifest: Manifest | null,
+): { info: PredictionInfo; rows: Map<string, PredictionRow> } {
+  const rows = new Map<string, PredictionRow>()
+  const jsonPath = join(repoRoot, 'ml', 'artifacts', 'predictions.json')
+
+  if (!existsSync(jsonPath)) {
+    // `debob predict-risk` defaults to --output ...predictions.csv, so the CSV existing
+    // alone is the likeliest miss. Name the exact fix rather than parsing CSV here.
+    const csvPath = join(repoRoot, 'ml', 'artifacts', 'predictions.csv')
+    return {
+      rows,
+      info: {
+        available: false,
+        hint: existsSync(csvPath)
+          ? 'Found predictions.csv. Re-run with --output ml/artifacts/predictions.json'
+          : 'Run: debob predict-risk --output ml/artifacts/predictions.json',
+      },
+    }
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(jsonPath, 'utf-8'))
+  } catch {
+    return { rows, info: { available: false, hint: 'predictions.json could not be parsed' } }
+  }
+  if (!Array.isArray(parsed)) {
+    return { rows, info: { available: false, hint: 'predictions.json is not an array of rows' } }
+  }
+
+  let modelName: string | undefined
+  for (const entry of parsed) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const row = entry as Record<string, unknown>
+    const filePath = typeof row['file_path'] === 'string' ? row['file_path'] : undefined
+    if (!filePath) continue
+    const probability = Number(row['risk_probability'])
+    if (!Number.isFinite(probability)) continue
+    if (typeof row['model'] === 'string') modelName = row['model']
+
+    // `risk_reasons` is a JSON-encoded *string*, not a nested object — predict_risk.py
+    // calls json.dumps on it before building the DataFrame, so it survives double-encoded.
+    let reasons: RiskReason[] = []
+    if (typeof row['risk_reasons'] === 'string') {
+      try {
+        const decoded: unknown = JSON.parse(row['risk_reasons'])
+        if (Array.isArray(decoded)) reasons = decoded as RiskReason[]
+      } catch {
+        reasons = []
+      }
+    }
+
+    rows.set(filePath, {
+      riskProbability: probability,
+      predictedRisky: Number(row['predicted_risky']) === 1,
+      riskReasons: reasons,
+    })
+  }
+
+  // The sidecar carries the scored-candidate count, which the truncated row list cannot.
+  let candidateCount: number | undefined
+  let stale = false
+  try {
+    const sidecar = JSON.parse(readFileSync(jsonPath + '.meta.json', 'utf-8')) as Record<string, unknown>
+    const candidates = Number(sidecar['candidate_count'])
+    if (Number.isFinite(candidates)) candidateCount = candidates
+    if (typeof sidecar['model_name'] === 'string') modelName = sidecar['model_name']
+    const heads = sidecar['db_head_commits']
+    if (Array.isArray(heads) && manifest?.headCommit) {
+      stale = heads.length > 0 && !heads.includes(manifest.headCommit)
+    }
+  } catch {
+    // A missing or unreadable sidecar only costs coverage metadata, not the overlay.
+  }
+
+  if (rows.size === 0) {
+    return { rows, info: { available: false, hint: 'predictions.json contained no usable rows' } }
+  }
+  return {
+    rows,
+    info: { available: true, rowsShown: rows.size, candidateCount, modelName, stale },
+  }
+}
+
 function serialiseNode(
   node: Node,
   enrichment?: { value: string; modelId: string },
+  prediction?: PredictionRow,
 ): VisualiserNode {
   return {
     id: node.id,
@@ -109,6 +252,12 @@ function serialiseNode(
     metadata: node.metadata,
     responsibility: enrichment?.value ?? node.responsibility,
     responsibilityModel: enrichment?.modelId,
+    // Left undefined when the file was never scored. The UI must distinguish that from
+    // `predictedRisky: false` — only file nodes are ever candidates, so symbol nodes have
+    // no prediction rather than a safe one.
+    riskProbability: prediction?.riskProbability,
+    predictedRisky: prediction?.predictedRisky,
+    riskReasons: prediction?.riskReasons,
   }
 }
 
@@ -219,7 +368,15 @@ const VISUALISER_HTML = `<!doctype html>
     .legend-swatch { border-radius: 50%; height: 9px; width: 9px; } .legend-line { border-radius: 2px; height: 3px; width: 13px; }
     .marker-enriched { background: #607083; box-shadow: 0 0 0 3px rgba(34,211,238,.45); margin: 0 2px; }
     .marker-hot { background: #607083; box-shadow: 0 0 0 2px #FF0000; margin: 0 1px; }
+    .marker-risk { background: #607083; box-shadow: 0 0 0 1px #101923, 0 0 0 3px #FF8A00; margin: 0 2px; }
     .legend-section + .legend-section { margin-top: 9px; }
+    .filter-option.disabled { cursor: not-allowed; opacity: .5; }
+    .filter-note { color: #8394a7; font-size: 11px; line-height: 1.45; margin: 5px 0 0 22px; overflow-wrap: anywhere; }
+    .filter-note.stale { color: #FFB347; }
+    .risk-reasons { list-style: none; margin: 7px 0 0; padding: 0; }
+    .risk-reasons li { border-bottom: 1px solid #223244; color: #dbe4ee; font-size: 11px; line-height: 1.45; padding: 6px 0; }
+    .risk-reasons .reason-value { color: #8fa3b9; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .risk-caveat { color: #7f93a8; font-size: 10px; letter-spacing: .05em; margin: 6px 0 0; text-transform: uppercase; }
     #inspector-empty { color: #8394a7; font-size: 13px; line-height: 1.5; }
     #inspector-content { display: none; } #inspector-content.visible { display: block; }
     .node-heading { color: white; font-size: 15px; margin: 0 0 15px; overflow-wrap: anywhere; }
@@ -251,6 +408,11 @@ const VISUALISER_HTML = `<!doctype html>
       <h2 class="panel-title">Filters</h2>
       <div id="node-type-filters"></div><div id="edge-type-filters"></div><div id="layer-filters"></div>
       <div class="filter-section"><label class="filter-option"><input id="hot-only" type="checkbox"> Hot files only</label></div>
+      <div class="filter-section">
+        <h3>Machine learning</h3>
+        <label class="filter-option" id="risk-overlay-label"><input id="risk-overlay" type="checkbox"> Predicted risky files only</label>
+        <p class="filter-note" id="risk-note"></p>
+      </div>
     </aside>
     <main id="graph-area">
       <div id="loading">Loading graph…</div><div id="cy"></div>
@@ -260,6 +422,7 @@ const VISUALISER_HTML = `<!doctype html>
         <div class="legend-section"><div class="legend-title">Markers</div><div class="legend-items">
           <div class="legend-item"><span class="legend-swatch marker-enriched"></span><span>described by watsonx</span></div>
           <div class="legend-item"><span class="legend-swatch marker-hot"></span><span>hot (high churn)</span></div>
+          <div class="legend-item" id="risk-legend-item" style="display:none"><span class="legend-swatch marker-risk"></span><span id="risk-legend-text">predicted risky</span></div>
         </div></div>
         <div class="legend-section"><div class="legend-title">Edge types</div><div class="legend-items" id="edge-legend"></div></div>
       </section>
@@ -279,7 +442,7 @@ const VISUALISER_HTML = `<!doctype html>
         communicates_with: '#C084FC', configured_by: '#FACC15', related_to: '#94A3B8'
       };
       var DEFAULT_EDGE_COLOR = '#94A3B8';
-      var state = { nodeTypes: new Set(NODE_TYPES), edgeTypes: new Set(EDGE_TYPES), layers: new Set(LAYERS), hotOnly: false, groupBy: 'folder' };
+      var state = { nodeTypes: new Set(NODE_TYPES), edgeTypes: new Set(EDGE_TYPES), layers: new Set(LAYERS), hotOnly: false, riskyOnly: false, groupBy: 'folder' };
       var graphData = null;
       var cy = null;
       var search = document.getElementById('search');
@@ -373,6 +536,19 @@ const VISUALISER_HTML = `<!doctype html>
         state.hotOnly = event.target.checked;
         applyFilters();
       });
+      document.getElementById('risk-overlay').addEventListener('change', function (event) {
+        state.riskyOnly = event.target.checked;
+        document.getElementById('risk-legend-item').style.display = event.target.checked ? '' : 'none';
+        // Filter + ring, but never a rebuild: applyFilters only shows/hides elements, so the
+        // layout positions the user is looking at survive the toggle.
+        applyFilters();
+        applyRiskOverlay();
+        // The visible set collapses from hundreds of nodes to a handful, and hidden nodes
+        // keep their layout positions - without a refit the survivors are stranded off
+        // screen at the old zoom. Refit on the way back out too.
+        var shown = cy.nodes(':visible');
+        if (shown.length) cy.animate({ fit: { eles: shown, padding: 60 }, duration: 260 });
+      });
       search.addEventListener('input', applyFilters);
       groupBySelect.addEventListener('change', function (event) {
         state.groupBy = event.target.value;
@@ -393,6 +569,7 @@ const VISUALISER_HTML = `<!doctype html>
         document.getElementById('node-count').textContent = (manifest ? manifest.nodeCount : data.nodes.length) + ' nodes';
         document.getElementById('edge-count').textContent = (manifest ? manifest.edgeCount : data.edges.length) + ' edges';
         document.getElementById('commit-count').textContent = (manifest ? manifest.commitCount : 0) + ' commits';
+        setupRiskControls(data.predictionInfo);
 
         var churns = data.nodes.filter(function (node) { return node.type === 'file'; }).map(function (node) { return Number(node.metadata && node.metadata.churnScore) || 0; });
         var maxChurn = Math.max.apply(Math, [0].concat(churns));
@@ -459,6 +636,11 @@ const VISUALISER_HTML = `<!doctype html>
           // red hot-file border instead of fighting it for the same visual channel.
           { selector: 'node.enriched', style: { 'underlay-color': '#22D3EE', 'underlay-opacity': .28, 'underlay-padding': 6 } },
           { selector: 'node.hot', style: { 'border-color': '#FF0000', 'border-width': 3 } },
+          // An offset outline, not a border: 'hot' already owns the border channel, and a
+          // file can be both. Orange rather than a second red so the two stay tellable
+          // apart - which is the interesting case, since the operational model excludes
+          // churn, so "risky but not hot" is exactly what the ML adds over the heuristic.
+          { selector: 'node.risk-high', style: { 'outline-color': '#FF8A00', 'outline-width': 4, 'outline-offset': 2, 'outline-opacity': 1 } },
           { selector: 'node.search-dim', style: { opacity: .13 } },
           { selector: 'node.search-match', style: { 'border-color': '#ffffff', 'border-width': 4, 'z-index': 999 } },
           { selector: 'node.region', style: {
@@ -543,22 +725,91 @@ const VISUALISER_HTML = `<!doctype html>
           hideEdgeTooltip();
         });
         applyFilters();
+        // Re-assert the overlay: changing group-by destroys and rebuilds the instance,
+        // which would otherwise drop the risk classes while the checkbox stays ticked.
+        applyRiskOverlay();
         loading.style.display = 'none';
+      }
+
+      /**
+       * Enables or disables the ML toggle and states the overlay's coverage.
+       *
+       * ml/artifacts/ is gitignored, so a fresh clone has the graph but no predictions -
+       * the disabled state is the normal path, not an error, and it names the command that
+       * would populate it.
+       */
+      function setupRiskControls(info) {
+        var checkbox = document.getElementById('risk-overlay');
+        var label = document.getElementById('risk-overlay-label');
+        var note = document.getElementById('risk-note');
+        if (!info || !info.available) {
+          checkbox.checked = false;
+          checkbox.disabled = true;
+          state.riskyOnly = false;
+          label.classList.add('disabled');
+          note.textContent = (info && info.hint) || 'No predictions found.';
+          return;
+        }
+        checkbox.disabled = false;
+        label.classList.remove('disabled');
+
+        // --top truncates the rows predict_risk.py *writes*, not just what it prints, so
+        // the file usually holds a handful of a much larger scored set. Say so plainly
+        // rather than letting the overlay imply it covers everything.
+        var coverage = info.candidateCount && info.candidateCount > info.rowsShown
+          ? 'top ' + info.rowsShown + ' of ' + info.candidateCount + ' scored'
+          : info.rowsShown + ' scored';
+        document.getElementById('risk-legend-text').textContent = 'predicted risky (' + coverage + ')';
+        var text = coverage + (info.modelName ? ' · ' + info.modelName : '');
+        if (info.stale) {
+          text += ' · STALE: scored against a different graph — re-run debob predict-risk';
+          note.classList.add('stale');
+        } else {
+          note.classList.remove('stale');
+        }
+        note.textContent = text;
+      }
+
+      /**
+       * Rings the files the model predicted risky.
+       *
+       * Only file nodes are ever scored, so a node with no riskProbability has *no data* -
+       * it is never styled as "predicted safe".
+       */
+      function applyRiskOverlay() {
+        if (!cy) return;
+        cy.nodes().forEach(function (element) {
+          if (element.hasClass('region')) return;
+          var node = element.data();
+          var risky = state.riskyOnly && node.predictedRisky === true;
+          if (risky) element.addClass('risk-high'); else element.removeClass('risk-high');
+        });
       }
 
       function applyFilters() {
         if (!cy || !graphData) return;
         var visibleNodes = new Set();
+        var regions = [];
         cy.nodes().forEach(function (element) {
-          if (element.hasClass('region')) { element.show(); return; }
+          // Regions are decided after their children, below - an empty box is worse than
+          // no box, and 'risky files only' empties most of them.
+          if (element.hasClass('region')) { regions.push(element); return; }
           var node = element.data();
           var layer = node.layer || 'unclassified';
           var hot = node.metadata && node.metadata.hot === true;
-          var visible = state.nodeTypes.has(node.type) && state.layers.has(layer) && (!state.hotOnly || hot);
+          // Only scored file nodes can satisfy riskyOnly. Symbols and unscored files have
+          // no prediction, so they drop out - "no data" is not "predicted safe".
+          var risky = node.predictedRisky === true;
+          var visible = state.nodeTypes.has(node.type) && state.layers.has(layer)
+            && (!state.hotOnly || hot) && (!state.riskyOnly || risky);
           if (visible) {
             visibleNodes.add(node.id);
             element.show();
           } else element.hide();
+        });
+        regions.forEach(function (element) {
+          var hasVisibleChild = element.children().some(function (child) { return child.visible(); });
+          if (hasVisibleChild) element.show(); else element.hide();
         });
         cy.edges().forEach(function (element) {
           var edge = element.data();
@@ -629,6 +880,36 @@ const VISUALISER_HTML = `<!doctype html>
         detail('Data source', node.dataSource); detail('Churn score', metadata(node, 'churnScore'));
         detail('Author count', metadata(node, 'authorCount')); detail('Last modified', metadata(node, 'lastModifiedAt'));
         detail('Hot', metadata(node, 'hot'));
+        // Risk fields only render for scored files. A node with no prediction shows no risk
+        // rows at all rather than a "no"/"0.00", which would read as "the model cleared it".
+        if (typeof node.riskProbability === 'number') {
+          detail('Risk probability', node.riskProbability.toFixed(3));
+          detail('Predicted risky', node.predictedRisky ? 'yes' : 'no');
+          if (node.riskReasons && node.riskReasons.length) {
+            var reasonsHeading = document.createElement('h4');
+            reasonsHeading.className = 'connected-title';
+            reasonsHeading.textContent = 'Influential signals';
+            inspector.appendChild(reasonsHeading);
+            var reasonList = document.createElement('ul');
+            reasonList.className = 'risk-reasons';
+            node.riskReasons.forEach(function (reason) {
+              var item = document.createElement('li');
+              item.textContent = reason.label;
+              var value = document.createElement('span');
+              value.className = 'reason-value';
+              value.textContent = ' · ' + reason.value;
+              item.appendChild(value);
+              reasonList.appendChild(item);
+            });
+            inspector.appendChild(reasonList);
+            // Global feature importance plus a threshold check - not per-file attribution.
+            // The model card makes the same distinction; the UI must not overstate it.
+            var caveat = document.createElement('p');
+            caveat.className = 'risk-caveat';
+            caveat.textContent = 'Model signals, not causal explanations';
+            inspector.appendChild(caveat);
+          }
+        }
         var connected = graphData.edges.filter(function (edge) { return edge.source === node.id || edge.target === node.id; });
         var heading = document.createElement('h4');
         heading.className = 'connected-title';

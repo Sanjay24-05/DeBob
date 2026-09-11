@@ -1,44 +1,52 @@
 import type { LLMAdapter } from './adapter.js'
 import type { LLMConfig } from './adapter.js'
 import { WatsonxProvider } from './providers/watsonx.js'
+import { OpenAIProvider } from './providers/openai.js'
 import { OpenRouterProvider } from './providers/openrouter.js'
 import type { DiffContext, ModuleContext, ModuleDescription, QueryContext, TokenUsage } from './adapter.js'
 
 // ─── LLM Adapter Factory ──────────────────────────────────────────────────────
 
+/** One provider in the fallback chain, plus why it is unavailable when it is. */
+interface Candidate {
+  /** Display name used in the combined error message. */
+  name: string
+  /** Constructed adapter, absent when construction failed. */
+  adapter?: LLMAdapter
+  /** Construction failure, kept so the combined error can explain it. */
+  error?: Error
+}
+
+function candidate(name: string, construct: () => LLMAdapter): Candidate {
+  try {
+    return { name, adapter: construct() }
+  } catch (error) {
+    return { name, error: asError(error) }
+  }
+}
+
 /**
  * Create an LLMAdapter for the given provider.
  *
  * V1 supported providers:
- *  - `"watsonx"` → `WatsonxProvider` (IBM watsonx.ai SDK, chat API)
+ *  - `"watsonx"` → watsonx, falling back to OpenAI then OpenRouter
  *
- * Future providers are added by importing their class and extending the switch.
+ * The returned adapter tries each configured provider in order and uses the first that
+ * answers, so a dead watsonx key degrades to OpenAI or OpenRouter instead of failing.
+ * Providers whose credentials are absent are skipped rather than treated as errors.
  *
- * @throws If `provider` is not a recognised value.
+ * @throws If no provider in the chain could be constructed.
  */
 export function createLLMAdapter(provider: string, config: LLMConfig): LLMAdapter {
   switch (provider) {
     case 'watsonx': {
-      let watsonx: LLMAdapter | undefined
-      let watsonxError: Error | undefined
-      try {
-        watsonx = new WatsonxProvider(config)
-      } catch (error) {
-        watsonxError = asError(error)
-      }
-
-      let openrouter: LLMAdapter | undefined
-      let openrouterError: Error | undefined
-      try {
-        openrouter = new OpenRouterProvider()
-      } catch (error) {
-        openrouterError = asError(error)
-      }
-
-      if (!watsonx && !openrouter) {
-        throw combinedProviderError(watsonxError, openrouterError)
-      }
-      return new FallbackLLMAdapter(watsonx, openrouter, watsonxError, openrouterError)
+      const candidates = [
+        candidate('Watsonx', () => new WatsonxProvider(config)),
+        candidate('OpenAI', () => new OpenAIProvider()),
+        candidate('OpenRouter', () => new OpenRouterProvider()),
+      ]
+      if (!candidates.some(entry => entry.adapter)) throw combinedProviderError(candidates)
+      return new FallbackLLMAdapter(candidates)
     }
     default:
       throw new Error(
@@ -51,22 +59,39 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error))
 }
 
-function combinedProviderError(watsonxError?: Error, openrouterError?: Error): Error {
-  return new Error(
-    `LLM providers unavailable. Watsonx: ${watsonxError?.message ?? 'not configured'}. ` +
-      `OpenRouter: ${openrouterError?.message ?? 'not configured'}.`,
-  )
+function combinedProviderError(candidates: Candidate[]): Error {
+  const detail = candidates
+    .map(entry => `${entry.name}: ${entry.error?.message ?? 'not configured'}`)
+    .join('. ')
+  return new Error(`LLM providers unavailable. ${detail}.`)
 }
 
 class FallbackLLMAdapter implements LLMAdapter {
-  readonly provider = 'watsonx-with-openrouter-fallback'
+  /** Name and model of whichever provider last answered, for enrichment provenance. */
+  private lastProvider: string | undefined
+  private lastModelId: string | undefined
 
-  constructor(
-    private readonly watsonx: LLMAdapter | undefined,
-    private readonly openrouter: LLMAdapter | undefined,
-    private readonly watsonxConstructionError?: Error,
-    private readonly openrouterConstructionError?: Error,
-  ) {}
+  constructor(private readonly candidates: Candidate[]) {}
+
+  /**
+   * Provider recorded on enrichments: the one that actually answered, or the chain's
+   * own name before any call has succeeded.
+   */
+  get provider(): string {
+    return this.lastProvider ?? 'watsonx-with-openai-fallback'
+  }
+
+  /**
+   * Model id recorded on enrichments, or `undefined` until a call succeeds.
+   *
+   * Deliberately does NOT fall back to the first *constructed* provider's model: a
+   * provider can construct (its key is present) and still never answer (the key is
+   * rejected), and naming it would record a model that produced none of the text.
+   * Callers read this after their calls complete; 'unknown' beats a false attribution.
+   */
+  get modelId(): string | undefined {
+    return this.lastModelId
+  }
 
   summarizeModule(context: ModuleContext): Promise<string> {
     return this.call('summarizeModule', adapter => adapter.summarizeModule(context))
@@ -92,9 +117,9 @@ class FallbackLLMAdapter implements LLMAdapter {
   }
 
   getUsage(): TokenUsage | undefined {
-    const usages = [this.watsonx?.getUsage?.(), this.openrouter?.getUsage?.()].filter(
-      (usage): usage is TokenUsage => usage !== undefined,
-    )
+    const usages = this.candidates
+      .map(entry => entry.adapter?.getUsage?.())
+      .filter((usage): usage is TokenUsage => usage !== undefined)
     if (usages.length === 0) return undefined
     return usages.reduce(
       (total, usage) => ({
@@ -111,34 +136,30 @@ class FallbackLLMAdapter implements LLMAdapter {
     operation: string,
     invoke: (adapter: LLMAdapter) => Promise<T>,
   ): Promise<T> {
-    let watsonxError = this.watsonxConstructionError
-    if (this.watsonx) {
+    const attempts: Candidate[] = []
+    for (const entry of this.candidates) {
+      if (!entry.adapter) {
+        attempts.push(entry)
+        continue
+      }
       try {
-        const result = await invoke(this.watsonx)
-        console.warn(`[debob llm] watsonx handled ${operation}`)
+        const result = await invoke(entry.adapter)
+        console.warn(`[debob llm] ${entry.name} handled ${operation}`)
+        this.lastProvider = (entry.adapter as unknown as { provider?: string }).provider ?? entry.name
+        this.lastModelId =
+          (entry.adapter as unknown as { modelId?: string }).modelId ?? this.lastModelId
         return result
       } catch (error) {
-        watsonxError = asError(error)
+        attempts.push({ name: entry.name, error: asError(error) })
       }
     }
-
-    let openrouterError = this.openrouterConstructionError
-    if (this.openrouter) {
-      try {
-        const result = await invoke(this.openrouter)
-        console.warn(`[debob llm] OpenRouter handled ${operation}`)
-        return result
-      } catch (error) {
-        openrouterError = asError(error)
-      }
-    }
-
-    throw combinedProviderError(watsonxError, openrouterError)
+    throw combinedProviderError(attempts)
   }
 }
 
 export type { LLMAdapter, LLMConfig }
 export { WatsonxProvider }
+export { OpenAIProvider }
 export { OpenRouterProvider }
 // Backward-compat alias
 export { WatsonxProvider as WatsonxAdapter }

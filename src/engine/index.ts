@@ -482,6 +482,17 @@ export async function runInit(
     })
     enrichments.push(...perNode.flat())
 
+    // Provenance is read AFTER the calls, not before: with a fallback chain, which provider
+    // answers is only known once one has. Reading it up front recorded whichever provider
+    // merely constructed first, which for a present-but-rejected key names a model that
+    // produced none of this text.
+    const answeredProvider = (llm as unknown as { provider?: string }).provider ?? provider
+    const answeredModelId = (llm as unknown as { modelId?: string }).modelId ?? modelId
+    for (const enrichment of enrichments) {
+      enrichment.llmProvider = answeredProvider
+      enrichment.modelId = answeredModelId
+    }
+
     adapter.saveSemanticEnrichments(enrichments)
 
     // Propagate layer enrichments back to Node.layer so layerDistribution is accurate
@@ -838,6 +849,17 @@ export async function runUpdate(
       }
     })
     enrichments.push(...perNode.flat())
+
+    // Provenance is read AFTER the calls, not before: with a fallback chain, which provider
+    // answers is only known once one has. Reading it up front recorded whichever provider
+    // merely constructed first, which for a present-but-rejected key names a model that
+    // produced none of this text.
+    const answeredProvider = (llm as unknown as { provider?: string }).provider ?? provider
+    const answeredModelId = (llm as unknown as { modelId?: string }).modelId ?? modelId
+    for (const enrichment of enrichments) {
+      enrichment.llmProvider = answeredProvider
+      enrichment.modelId = answeredModelId
+    }
 
     adapter.saveSemanticEnrichments(enrichments)
 

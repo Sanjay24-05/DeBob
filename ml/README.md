@@ -24,6 +24,7 @@ Then export and label the current graph:
 .\ml\.venv\Scripts\python.exe .\ml\export_features.py
 .\ml\.venv\Scripts\python.exe .\ml\label.py
 .\ml\.venv\Scripts\python.exe .\ml\train_models.py
+.\ml\.venv\Scripts\python.exe .\ml\cluster_models.py
 .\ml\.venv\Scripts\python.exe .\ml\predict_risk.py --output .\ml\artifacts\predictions.json
 .\ml\.venv\Scripts\python.exe .\ml\export_presentation.py
 ```

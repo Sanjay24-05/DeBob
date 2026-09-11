@@ -60,7 +60,13 @@ describe('OpenRouterProvider', () => {
     })
     expect(JSON.parse(String(init?.body))).toMatchObject({
       model: 'test/model',
-      messages: [{ role: 'user', content: expect.stringContaining('src/example.ts') }],
+      // Roles are sent as-is. They used to be flattened into a single user turn, which
+      // demoted every "reply with ONLY JSON" system instruction to ordinary user text
+      // and made describeModule fall back to two calls whenever the reply didn't parse.
+      messages: [
+        { role: 'system', content: expect.stringContaining('architecture assistant') },
+        { role: 'user', content: expect.stringContaining('src/example.ts') },
+      ],
     })
   })
 
